@@ -31,10 +31,11 @@ CURRENT_THRESHOLD = 0.1  # A
 DETECTION_STABILITY_TIME = 5  # seconds
 CHARGING_CHECK_TIME = 600  # 10 minutes
 ALARM_INTERVALS = [180, 300, 600]  # 3 minutes, 5 minutes, 10 minutes
-LINE_NOTIFY_TOKEN = os.getenv("LINE_NOTIFY_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = "ev_monitoring"
-COLLECTION_NAME = "events"
+LINE_NOTIFY_TOKEN = "J0oQ74OftbCNdiPCCfV4gs75aqtz4aAL8NiGfHERvZ4"
+# MONGO_URI = os.getenv("MONGO_URI")
+MONGO_URI = "mongodb+srv://Extremenop:Nop24681036@cardb.ynz57.mongodb.net/?retryWrites=true&w=majority&appName=Cardb"
+DB_NAME = "cardb"
+COLLECTION_NAME = "nonev"
 
 # HC-SR04P Constants
 TRIG_PIN = 12
