@@ -8,6 +8,9 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from gridfs import GridFS
 import os
+import threading
+from queue import Queue
+from collections import deque
 
 # Assume these imports are correctly set up in your environment
 from hc_sr04p_distance import filtered_distance
@@ -22,11 +25,11 @@ logger = logging.getLogger(__name__)
 
 # Constants
 DISTANCE_THRESHOLD = 150  # cm
-CHARGING_TIMEOUT = 600  # 10 minutes in seconds
-CURRENT_THRESHOLD = 0.1  # A
+CHARGING_TIMEOUT = 60  # 1 minute in seconds
+CURRENT_THRESHOLD = 1.0  # A
 DETECTION_STABILITY_TIME = 5  # seconds
-DISTANCE_READINGS = 2  # Number of distance readings to average
-SLEEP_DURATION = 120  # 2 minutes in seconds
+DISTANCE_READINGS = 5  # Number of distance readings to average
+SLEEP_DURATION = 10  # 10 seconds between test cycles
 
 # MongoDB setup
 MONGO_URI = "mongodb+srv://Extremenop:Nop24681036@cardb.ynz57.mongodb.net/?retryWrites=true&w=majority&appName=Cardb"
@@ -53,22 +56,56 @@ class SensorManager:
         self.collection = self.db[COLLECTION_NAME]
         self.fs = GridFS(self.db)
 
-    def check_distance(self):
-        distances = []
-        for _ in range(DISTANCE_READINGS):
-            reading = filtered_distance()
-            if reading is not None:
-                try:
-                    # Extract the numeric part and convert to float
-                    numeric_distance = float(str(reading).split()[0])
-                    distances.append(numeric_distance)
-                except (ValueError, IndexError):
-                    logger.warning(f"Invalid distance reading: {reading}")
-        
-        avg_distance = sum(distances) / len(distances) if distances else None
-        if avg_distance is not None:
-            logger.info(f"Measured Distance = {avg_distance:.2f} cm")
-        return avg_distance
+        # Threading setup
+        self.distance_queue = Queue()
+        self.pzem_queue = Queue()
+        self.detection_queue = Queue()
+        self.stop_event = threading.Event()
+
+        # Deques for storing recent readings
+        self.distance_deque = deque(maxlen=DISTANCE_READINGS)
+        self.detection_deque = deque(maxlen=DETECTION_STABILITY_TIME)
+
+    def distance_thread(self):
+        while not self.stop_event.is_set():
+            distance = filtered_distance()
+            if distance is not None:
+                self.distance_queue.put(distance)
+            time.sleep(1)
+
+    def pzem_thread(self):
+        while not self.stop_event.is_set():
+            pzem_data = read_sensor_data(self.pzem_master)
+            self.pzem_queue.put(pzem_data)
+            time.sleep(1)
+
+    def detection_thread(self):
+        while not self.stop_event.is_set():
+            if self.camera is None or not self.camera.isOpened():
+                if not self.open_camera():
+                    time.sleep(1)
+                    continue
+            
+            ret, frame = self.camera.read()
+            if not ret:
+                logger.error("Failed to capture frame")
+                self.close_camera()
+                time.sleep(1)
+                continue
+            
+            results = self.model(frame)
+            detection = self.process_yolo_results(results)
+            self.detection_queue.put((detection, frame))
+            time.sleep(0.1)
+
+    def process_yolo_results(self, results):
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                cls = int(box.cls[0])
+                if cls == 2 or cls == 80:  # Assuming class 2 is 'face' for testing
+                    return True
+        return False
 
     def open_camera(self):
         try:
@@ -89,65 +126,14 @@ class SensorManager:
             self.camera = None
             logger.info("Camera closed")
 
-    def detect_vehicle(self):
-        detection_start_time = time.time()
-        logger.info("Entering detect_vehicle method")
-        
-        if not self.open_camera():
-            logger.error("Failed to open camera in detect_vehicle")
-            return None, None
-        
-        while time.time() - detection_start_time < DETECTION_STABILITY_TIME:
-            ret, frame = self.camera.read()
-            if not ret:
-                logger.error("Failed to capture frame")
-                self.close_camera()
-                return None, None
-            
-            results = self.model(frame)
-            car_detected, is_ev = self.process_yolo_results(results)
-            
-            if car_detected:
-                logger.info(f"Vehicle detected: {'EV' if is_ev else 'Non-EV'}")
-                return is_ev, frame
-        
-        logger.info("No vehicle detected within stability time")
-        self.close_camera()
-        return None, None
-
-    def process_yolo_results(self, results):
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                cls = int(box.cls[0])
-                if cls == 2:  # Assuming class 2 is 'car'
-                    return True, False
-                elif cls == 80:  # Assuming class 80 is 'ev'
-                    return True, True
-        return False, False
-
-    def monitor_charging(self):
-        start_time = time.time()
-        while time.time() - start_time < CHARGING_TIMEOUT:
-            distance = self.check_distance()
-            if distance is None or distance > DISTANCE_THRESHOLD:
-                logger.info("Vehicle left before charging timeout")
-                return None  # Vehicle left before timeout
-            
-            pzem_data = read_sensor_data(self.pzem_master)
-            if pzem_data['current_A'] > CURRENT_THRESHOLD:
-                return True  # Charging detected
-            time.sleep(5)
-        return False  # Timeout reached, no charging detected
-
-    def play_alert(self):
-        for sound_file in ["alert.mp3", "Warning.mp3"]:
-            try:
-                pygame.mixer.music.load(sound_file)
-                pygame.mixer.music.play()
-                pygame.time.wait(int(pygame.mixer.Sound(sound_file).get_length() * 1000))
-            except pygame.error as e:
-                logger.error(f"Error playing sound {sound_file}: {e}")
+    def play_sound(self, sound_file):
+        try:
+            pygame.mixer.music.load(sound_file)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+        except pygame.error as e:
+            logger.error(f"Error playing sound {sound_file}: {e}")
 
     def save_image_to_gridfs(self, frame, timestamp):
         _, img_encoded = cv2.imencode('.jpg', frame)
@@ -161,14 +147,14 @@ class SensorManager:
         }
         return self.collection.insert_one(metadata)
 
-    def handle_detection(self, frame, is_ev):
+    def handle_detection(self, frame):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        event = "non_charging_ev" if is_ev else "non_ev_parked"
-        message = f"{timestamp} {'an Electric vehicle is not charging' if is_ev else 'a non-EV car is detected'}"
+        event = "face_detected"
+        message = f"{timestamp} Face detected and not charging"
         
-        self.play_alert()
+        self.play_sound("alert.mp3")
         
-        local_path = f"detected_vehicle_{timestamp.replace(':', '-')}.jpg"
+        local_path = f"detected_face_{timestamp.replace(':', '-')}.jpg"
         cv2.imwrite(local_path, frame)
         
         try:
@@ -186,55 +172,76 @@ class SensorManager:
             logger.error(f"Failed to send Line notification: {e}")
 
     def run(self):
-        while True:
-            distance = self.check_distance()
-            if distance is None:
-                logger.warning("Failed to get valid distance measurement")
-                time.sleep(1)
-                continue
-            
-            if distance > DISTANCE_THRESHOLD:
-                logger.info(f"No object within threshold. Distance: {distance:.2f} cm")
-                time.sleep(1)
-                continue
+        threads = [
+            threading.Thread(target=self.distance_thread),
+            threading.Thread(target=self.pzem_thread),
+            threading.Thread(target=self.detection_thread)
+        ]
+        for thread in threads:
+            thread.start()
 
-            logger.info(f"Object detected within threshold. Distance: {distance:.2f} cm")
-            is_ev, frame = self.detect_vehicle()
-            if is_ev is None:
-                logger.info("No vehicle consistently detected, continuing to monitor")
-                continue
-            elif not is_ev:
-                logger.info("Non-EV detected, handling detection")
-                self.handle_detection(frame, is_ev=False)
-            else:
-                logger.info("EV detected, monitoring charging")
-                charging_result = self.monitor_charging()
-                if charging_result is None:
-                    logger.info("Vehicle left during charging monitoring")
-                    continue
-                elif not charging_result:
-                    logger.info("EV not charging, handling detection")
-                    self.handle_detection(frame, is_ev=True)
-                else:
-                    logger.info("EV charged successfully")
-            
-            self.close_camera()
-            time.sleep(SLEEP_DURATION)
+        try:
+            while not self.stop_event.is_set():
+                # Process distance readings
+                while not self.distance_queue.empty():
+                    distance = self.distance_queue.get()
+                    self.distance_deque.append(distance)
+
+                # Process detections
+                while not self.detection_queue.empty():
+                    detection, frame = self.detection_queue.get()
+                    self.detection_deque.append(detection)
+
+                # Check conditions
+                if len(self.distance_deque) == DISTANCE_READINGS and len(self.detection_deque) == DETECTION_STABILITY_TIME:
+                    avg_distance = sum(self.distance_deque) / len(self.distance_deque)
+                    all_detected = all(self.detection_deque)
+
+                    if avg_distance <= DISTANCE_THRESHOLD and all_detected:
+                        logger.info("Face detected consistently and within range")
+                        self.handle_detection(frame)
+
+                        # Monitor PZEM for 1 minute
+                        start_time = time.time()
+                        charging_detected = False
+                        while time.time() - start_time < CHARGING_TIMEOUT:
+                            if not self.pzem_queue.empty():
+                                pzem_data = self.pzem_queue.get()
+                                if pzem_data['current_A'] > CURRENT_THRESHOLD:
+                                    charging_detected = True
+                                    break
+                            time.sleep(1)
+
+                        if not charging_detected:
+                            logger.info("Not charging after 1 minute")
+                            self.play_sound("not_charging.mp3")
+
+                        # Clear deques for next cycle
+                        self.distance_deque.clear()
+                        self.detection_deque.clear()
+
+                        # Wait for 10 seconds before next test cycle
+                        time.sleep(SLEEP_DURATION)
+
+                time.sleep(0.1)  # Small sleep to prevent CPU hogging
+
+        except KeyboardInterrupt:
+            logger.info("Program stopped by user")
+        finally:
+            self.stop_event.set()
+            for thread in threads:
+                thread.join()
+            self.cleanup()
 
     def cleanup(self):
         self.close_camera()
         self.pzem_master.close()
         self.client.close()
+        logger.info("Cleanup completed")
 
 def main():
     manager = SensorManager()
-    try:
-        manager.run()
-    except KeyboardInterrupt:
-        logger.info("Program stopped by user")
-    finally:
-        manager.cleanup()
-        logger.info("Cleanup completed")
+    manager.run()
 
 if __name__ == "__main__":
     main()
